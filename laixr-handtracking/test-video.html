@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        video {
+            width: 100%;
+            max-width: 640px;
+            border: 1px solid #ccc;
+            margin: 20px 0;
+        }
+        .info {
+            background: #f5f5f5;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+        .error {
+            background: #ffe6e6;
+            color: #d00;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>Video Playback Test</h1>
+    
+    <div class="info">
+        <p>Testing video playback from backend API endpoint:</p>
+        <p><strong>URL:</strong> <span id="videoUrl">http://localhost:8000/api/analysis/f58f3890-fe34-4bb0-96b2-ac39b20b233b/video</span></p>
+    </div>
+
+    <video id="testVideo" controls preload="metadata">
+        <source src="http://localhost:8000/api/analysis/f58f3890-fe34-4bb0-96b2-ac39b20b233b/video" type="video/mp4">
+        Your browser does not support the video tag.
+    </video>
+
+    <div id="videoInfo" class="info" style="display: none;">
+        <h3>Video Information:</h3>
+        <p><strong>Duration:</strong> <span id="duration">-</span></p>
+        <p><strong>Dimensions:</strong> <span id="dimensions">-</span></p>
+        <p><strong>Ready State:</strong> <span id="readyState">-</span></p>
+        <p><strong>Network State:</strong> <span id="networkState">-</span></p>
+    </div>
+
+    <div id="errorInfo" class="error" style="display: none;">
+        <h3>Error Information:</h3>
+        <p id="errorMessage">-</p>
+        <p><strong>Error Code:</strong> <span id="errorCode">-</span></p>
+        <p><strong>Error Details:</strong> <span id="errorDetails">-</span></p>
+    </div>
+
+    <script>
+        const video = document.getElementById('testVideo');
+        const videoInfo = document.getElementById('videoInfo');
+        const errorInfo = document.getElementById('errorInfo');
+
+        function updateVideoInfo() {
+            document.getElementById('duration').textContent = video.duration ? `${video.duration.toFixed(2)}s` : 'Unknown';
+            document.getElementById('dimensions').textContent = video.videoWidth && video.videoHeight ? `${video.videoWidth}x${video.videoHeight}` : 'Unknown';
+            document.getElementById('readyState').textContent = video.readyState;
+            document.getElementById('networkState').textContent = video.networkState;
+            videoInfo.style.display = 'block';
+        }
+
+        function showError(error) {
+            document.getElementById('errorMessage').textContent = error.message || 'Unknown error';
+            document.getElementById('errorCode').textContent = error.code || 'Unknown';
+            document.getElementById('errorDetails').textContent = JSON.stringify({
+                networkState: video.networkState,
+                readyState: video.readyState,
+                src: video.src,
+                currentSrc: video.currentSrc
+            }, null, 2);
+            errorInfo.style.display = 'block';
+        }
+
+        video.addEventListener('loadedmetadata', () => {
+            console.log('Video metadata loaded');
+            updateVideoInfo();
+        });
+
+        video.addEventListener('canplay', () => {
+            console.log('Video can start playing');
+            updateVideoInfo();
+        });
+
+        video.addEventListener('error', (event) => {
+            console.error('Video error:', event);
+            console.error('Video error object:', video.error);
+            showError(video.error || { message: 'Unknown video error', code: 'Unknown' });
+        });
+
+        video.addEventListener('loadstart', () => {
+            console.log('Video load started');
+        });
+
+        video.addEventListener('progress', () => {
+            console.log('Video loading progress');
+        });
+
+        // Test direct fetch
+        fetch('http://localhost:8000/api/analysis/f58f3890-fe34-4bb0-96b2-ac39b20b233b/video', { method: 'HEAD' })
+            .then(response => {
+                console.log('HEAD request response:', response.status, response.headers);
+            })
+            .catch(error => {
+                console.error('HEAD request failed:', error);
+            });
+    </script>
+</body>
+</html> 
