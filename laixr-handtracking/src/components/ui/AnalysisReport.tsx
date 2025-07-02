@@ -390,10 +390,19 @@ const VideoPlayer = ({ analysisId }: { analysisId: string }) => {
   const [isMuted, setIsMuted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const videoUrl = `${BACKEND_URL}/api/analysis/${analysisId}/video`;
+
+  // Format time to mm:ss
+  const formatTime = (seconds: number): string => {
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = Math.floor(seconds % 60);
+    return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+  };
 
   const togglePlay = () => {
     if (videoRef.current) {
@@ -488,6 +497,21 @@ const VideoPlayer = ({ analysisId }: { analysisId: string }) => {
 
   const handleVideoLoad = () => {
     setError(null);
+    if (videoRef.current) {
+      setDuration(videoRef.current.duration || 0);
+    }
+  };
+
+  const handleTimeUpdate = () => {
+    if (videoRef.current) {
+      setCurrentTime(videoRef.current.currentTime || 0);
+    }
+  };
+
+  const handleLoadedMetadata = () => {
+    if (videoRef.current) {
+      setDuration(videoRef.current.duration || 0);
+    }
   };
 
   return (
@@ -519,6 +543,8 @@ const VideoPlayer = ({ analysisId }: { analysisId: string }) => {
             onEnded={() => setIsPlaying(false)}
             onError={handleVideoError}
             onLoadedData={handleVideoLoad}
+            onTimeUpdate={handleTimeUpdate}
+            onLoadedMetadata={handleLoadedMetadata}
             controls={false}
             playsInline
           />
@@ -550,12 +576,19 @@ const VideoPlayer = ({ analysisId }: { analysisId: string }) => {
                 </button>
               </div>
               
-              <button
-                onClick={toggleFullscreen}
-                className="p-2 rounded-full bg-white/20 hover:bg-white/30 transition-colors"
-              >
-                <Maximize className="w-4 h-4" />
-              </button>
+              {/* Time Display */}
+              <div className="flex items-center gap-3">
+                <div className="text-sm font-mono bg-black/30 px-2 py-1 rounded">
+                  {formatTime(currentTime)} / {formatTime(duration)}
+                </div>
+                
+                <button
+                  onClick={toggleFullscreen}
+                  className="p-2 rounded-full bg-white/20 hover:bg-white/30 transition-colors"
+                >
+                  <Maximize className="w-4 h-4" />
+                </button>
+              </div>
             </div>
           </div>
         </div>

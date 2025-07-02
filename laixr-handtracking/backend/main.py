@@ -800,12 +800,9 @@ async def download_analysis_csv(analysis_id: str):
             hand_summary = left_summary if hand_label == 'Left' else right_summary
             final_total_path = hand_summary.get('total_path_pixels', '')
             final_peak_velocity = hand_summary.get('peak_velocity_pps', '')
-            final_average_velocity = hand_summary.get('average_velocity_pps', '')  # NEW
             final_peak_acceleration = hand_summary.get('peak_acceleration_pps2', '')
-            final_average_acceleration = hand_summary.get('average_acceleration_pps2', '')  # NEW
             final_peak_jerk = hand_summary.get('peak_jerk_pps3', '')
             final_log_dimensionless_jerk = hand_summary.get('log_dimensionless_jerk', '')
-            final_squared_jerk_integral = hand_summary.get('squared_jerk_integral', '')  # NEW
                 
             # Convert normalized coordinates to pixels
             hand_df['x_pixels'] = hand_df['x'] * image_width
@@ -913,10 +910,10 @@ async def download_analysis_csv(analysis_id: str):
                     final_log_dimensionless_jerk,
                     final_total_path,
                     final_peak_velocity,
-                    final_average_velocity,  # NEW
+                    final_average_velocity_pps,  # NEW
                     final_peak_acceleration,
-                    final_average_acceleration,  # NEW
-                    final_peak_jerk,
+                    final_average_acceleration_pps2,  # NEW
+                    final_peak_jerk_pps3,
                     final_squared_jerk_integral  # NEW
                 ])
         

@@ -29,6 +29,10 @@ import {
   Sparkles,
   ArrowRightLeft,
   Play,
+  Pause,
+  RotateCcw,
+  VolumeX,
+  Volume2,
 } from 'lucide-react';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Slider } from '@/components/ui/slider';
@@ -190,9 +194,49 @@ const LiveAnalysisViewer = ({ analysisId, onClose }: { analysisId: string; onClo
 
 const VideoModal = ({ analysisId, fileName, onClose }: { analysisId: string; fileName: string; onClose: () => void; }) => {
     const [error, setError] = useState<string | null>(null);
+    const [isPlaying, setIsPlaying] = useState(false);
+    const [isMuted, setIsMuted] = useState(false);
+    const [currentTime, setCurrentTime] = useState(0);
+    const [duration, setDuration] = useState(0);
     const videoRef = useRef<HTMLVideoElement>(null);
+    const containerRef = useRef<HTMLDivElement>(null);
 
     const videoUrl = `${BACKEND_URL}/api/analysis/${analysisId}/video`;
+
+    // Format time to mm:ss
+    const formatTime = (seconds: number): string => {
+        const minutes = Math.floor(seconds / 60);
+        const remainingSeconds = Math.floor(seconds % 60);
+        return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+    };
+
+    const togglePlay = () => {
+        if (videoRef.current) {
+            if (isPlaying) {
+                videoRef.current.pause();
+            } else {
+                videoRef.current.play().catch((err) => {
+                    setError(`Playback failed: ${err.message}`);
+                });
+            }
+        }
+    };
+
+    const toggleMute = () => {
+        if (videoRef.current) {
+            videoRef.current.muted = !isMuted;
+            setIsMuted(!isMuted);
+        }
+    };
+
+    const restart = () => {
+        if (videoRef.current) {
+            videoRef.current.currentTime = 0;
+            videoRef.current.play().catch((err) => {
+                setError(`Playback failed: ${err.message}`);
+            });
+        }
+    };
 
     const handleVideoError = (event: any) => {
         console.error('Video error event:', event);
@@ -240,6 +284,21 @@ const VideoModal = ({ analysisId, fileName, onClose }: { analysisId: string; fil
 
     const handleVideoLoad = () => {
         setError(null);
+        if (videoRef.current) {
+            setDuration(videoRef.current.duration || 0);
+        }
+    };
+
+    const handleTimeUpdate = () => {
+        if (videoRef.current) {
+            setCurrentTime(videoRef.current.currentTime || 0);
+        }
+    };
+
+    const handleLoadedMetadata = () => {
+        if (videoRef.current) {
+            setDuration(videoRef.current.duration || 0);
+        }
     };
 
     return (
@@ -270,18 +329,59 @@ const VideoModal = ({ analysisId, fileName, onClose }: { analysisId: string; fil
                             </button>
                         </div>
                     ) : (
-                        <video
-                            ref={videoRef}
-                            src={videoUrl}
-                            className="max-w-full max-h-full rounded-lg"
-                            controls
-                            autoPlay
-                            onError={handleVideoError}
-                            onLoadedData={handleVideoLoad}
-                            playsInline
-                        >
-                            Your browser does not support the video tag.
-                        </video>
+                        <div ref={containerRef} className="relative max-w-full max-h-full bg-black rounded-lg overflow-hidden">
+                            <video
+                                ref={videoRef}
+                                src={videoUrl}
+                                className="max-w-full max-h-full block"
+                                autoPlay
+                                onPlay={() => setIsPlaying(true)}
+                                onPause={() => setIsPlaying(false)}
+                                onEnded={() => setIsPlaying(false)}
+                                onError={handleVideoError}
+                                onLoadedData={handleVideoLoad}
+                                onTimeUpdate={handleTimeUpdate}
+                                onLoadedMetadata={handleLoadedMetadata}
+                                controls={false}
+                                playsInline
+                            >
+                                Your browser does not support the video tag.
+                            </video>
+                            
+                            {/* Custom Controls Overlay */}
+                            <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent p-4">
+                                <div className="flex items-center justify-between text-white">
+                                    <div className="flex items-center gap-3">
+                                        <button
+                                            onClick={togglePlay}
+                                            className="p-2 rounded-full bg-white/20 hover:bg-white/30 transition-colors"
+                                        >
+                                            {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5" />}
+                                        </button>
+                                        
+                                        <button
+                                            onClick={restart}
+                                            className="p-2 rounded-full bg-white/20 hover:bg-white/30 transition-colors"
+                                            title="Restart"
+                                        >
+                                            <RotateCcw className="w-4 h-4" />
+                                        </button>
+                                        
+                                        <button
+                                            onClick={toggleMute}
+                                            className="p-2 rounded-full bg-white/20 hover:bg-white/30 transition-colors"
+                                        >
+                                            {isMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+                                        </button>
+                                    </div>
+                                    
+                                    {/* Time Display */}
+                                    <div className="text-sm font-mono bg-black/30 px-3 py-1 rounded">
+                                        {formatTime(currentTime)} / {formatTime(duration)}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                     )}
                 </div>
             </div>
