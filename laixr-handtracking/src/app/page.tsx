@@ -38,6 +38,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { Slider } from '@/components/ui/slider';
 import AnalysisReport from '@/components/ui/AnalysisReport';
 import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip as RechartsTooltip, Legend, ResponsiveContainer } from 'recharts';
+ 
 
 
 // Backend configuration
@@ -301,6 +302,17 @@ const VideoModal = ({ analysisId, fileName, onClose }: { analysisId: string; fil
         }
     };
 
+    const handleSeekChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+        const newTime = Number(e.target.value);
+        setCurrentTime(newTime);
+    };
+
+    const handleSeekCommit = (e: React.ChangeEvent<HTMLInputElement>) => {
+        if (!videoRef.current) return;
+        const newTime = Number(e.target.value);
+        videoRef.current.currentTime = newTime;
+    };
+
     return (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50">
             <div className="bg-card rounded-lg max-w-6xl w-full max-h-[90vh] flex flex-col shadow-2xl">
@@ -333,6 +345,8 @@ const VideoModal = ({ analysisId, fileName, onClose }: { analysisId: string; fil
                             <video
                                 ref={videoRef}
                                 src={videoUrl}
+                                preload="metadata"
+                                crossOrigin="anonymous"
                                 className="max-w-full max-h-full block"
                                 autoPlay
                                 onPlay={() => setIsPlaying(true)}
@@ -348,8 +362,22 @@ const VideoModal = ({ analysisId, fileName, onClose }: { analysisId: string; fil
                                 Your browser does not support the video tag.
                             </video>
                             
-                            {/* Custom Controls Overlay */}
+                            {/* Custom Controls Overlay with Seek Bar */}
                             <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent p-4">
+                                <div className="w-full mb-2">
+                                    <input
+                                      type="range"
+                                      min={0}
+                                      max={Math.max(0, duration)}
+                                      step={0.01}
+                                      value={Math.min(currentTime, duration)}
+                                      onChange={handleSeekChange}
+                                      onInput={handleSeekChange}
+                                      onMouseUp={handleSeekCommit}
+                                      onTouchEnd={(e) => handleSeekCommit(e as any)}
+                                      className="w-full accent-primary"
+                                    />
+                                </div>
                                 <div className="flex items-center justify-between text-white">
                                     <div className="flex items-center gap-3">
                                         <button
@@ -487,7 +515,7 @@ export default function Dashboard() {
     const failed = analyses.filter(a => a.status === 'Failed').length;
     const completed = completedAnalyses.length;
 
-    const avgDexterity = completedAnalyses.reduce((acc, a) => acc + (a.analysisResult?.summary?.overall_dexterity_score || 0), 0) / (completedAnalyses.length || 1);
+    const avgDexterity = completedAnalyses.reduce((acc, a) => acc + ((a.analysisResult?.summary?.Overall?.dexterity_score as number) || 0), 0) / (completedAnalyses.length || 1);
 
     const statusDistribution = [
         { name: 'Completed', value: completed, color: 'hsl(var(--chart-2))' },
@@ -528,9 +556,9 @@ export default function Dashboard() {
           case 'date-asc':
             return new Date(a.date).getTime() - new Date(b.date).getTime();
           case 'score-desc':
-            return (b.analysisResult?.summary?.overall_dexterity_score ?? -1) - (a.analysisResult?.summary?.overall_dexterity_score ?? -1);
+            return ((b.analysisResult?.summary?.Overall?.dexterity_score as number) ?? -1) - ((a.analysisResult?.summary?.Overall?.dexterity_score as number) ?? -1);
           case 'score-asc':
-            return (a.analysisResult?.summary?.overall_dexterity_score ?? -1) - (b.analysisResult?.summary?.overall_dexterity_score ?? -1);
+            return ((a.analysisResult?.summary?.Overall?.dexterity_score as number) ?? -1) - ((b.analysisResult?.summary?.Overall?.dexterity_score as number) ?? -1);
           case 'date-desc':
           default:
             return new Date(b.date).getTime() - new Date(a.date).getTime();
@@ -559,7 +587,8 @@ export default function Dashboard() {
                     ...a,
                     status: statusFromBackend(data.status),
                     errorMessage: data.error_message,
-                    analysisResult: data.results ? (typeof data.results === 'string' ? JSON.parse(data.results) : data.results) : undefined,
+                    // Backend returns the full results object as response body
+                    analysisResult: data,
                 };
             }
             return a;
@@ -803,7 +832,7 @@ export default function Dashboard() {
 
             <div className="grid grid-cols-1 lg:grid-cols-5 gap-8">
                 <div className="lg:col-span-3 bg-card border-border rounded-lg p-6">
-                    <h3 className="text-lg font-semibold mb-4 flex items-center gap-2"><Activity className="w-5 h-5"/>Weekly Analysis Activity</h3>
+                    <h3 className="text-lg font-semibold mb-4 text-center">Upload New Video</h3>
                     <ResponsiveContainer width="100%" height={250}>
                         <BarChart data={stats.weeklyActivity} margin={{ top: 5, right: 20, left: -10, bottom: 5 }}>
                             <XAxis dataKey="date" tickLine={false} axisLine={false} tick={{ fill: 'hsl(var(--muted-foreground))', fontSize: 12 }} />
@@ -903,6 +932,26 @@ export default function Dashboard() {
                   <option value="score-desc">Highest Score</option>
                   <option value="score-asc">Lowest Score</option>
                 </select>
+                <div className="hidden md:flex items-center gap-2 ml-4">
+                  <button
+                    onClick={() => window.location.href = `${BACKEND_URL}/api/analyses/download_raw_landmarks_csv`}
+                    className="px-3 py-1.5 text-xs bg-primary/90 text-primary-foreground rounded-md hover:bg-primary"
+                  >
+                    Download Raw Landmarks CSV (All)
+                  </button>
+                  <button
+                    onClick={() => window.location.href = `${BACKEND_URL}/api/analyses/download_timeseries_csv`}
+                    className="px-3 py-1.5 text-xs bg-primary/90 text-primary-foreground rounded-md hover:bg-primary"
+                  >
+                    Download Kinematics CSV (All)
+                  </button>
+                  <button
+                    onClick={() => window.location.href = `${BACKEND_URL}/api/analyses/download_final_values_csv`}
+                    className="px-3 py-1.5 text-xs bg-green-600 text-white rounded-md hover:bg-green-700"
+                  >
+                    Download Final Values CSV (All)
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -937,6 +986,8 @@ export default function Dashboard() {
               <AnalysisReport file={selectedFile} />
           </div>
         )}
+
+        
 
         {selectedView === 'settings' && (
             <div className="max-w-4xl mx-auto">
@@ -1140,7 +1191,7 @@ function AnalysisCard({ file, onDelete, onViewReport, onViewLive, onWatchVideo, 
   const { id, name, date, status, analysisResult, errorMessage } = file;
 
   const summary = analysisResult?.summary;
-  const score = summary?.overall_dexterity_score;
+  const score: number | undefined = summary?.Overall?.dexterity_score;
   const leftSummary = summary?.Left;
   const rightSummary = summary?.Right;
   

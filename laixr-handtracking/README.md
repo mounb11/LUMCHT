@@ -47,6 +47,17 @@ start.bat
 
 The application will be available at **http://localhost:3000**
 
+Set environment variable for frontend-backend communication:
+
+Windows PowerShell:
+```powershell
+$env:NEXT_PUBLIC_BACKEND_URL="http://localhost:8000"
+```
+macOS/Linux:
+```bash
+export NEXT_PUBLIC_BACKEND_URL=http://localhost:8000
+```
+
 ### ⏹️ Stopping the Application
 
 Press **`CTRL+C`** in the terminal to stop both servers.

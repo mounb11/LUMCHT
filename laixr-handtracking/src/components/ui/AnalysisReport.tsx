@@ -389,6 +389,7 @@ const VideoPlayer = ({ analysisId }: { analysisId: string }) => {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isSeeking, setIsSeeking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -514,6 +515,17 @@ const VideoPlayer = ({ analysisId }: { analysisId: string }) => {
     }
   };
 
+  const handleSeekChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const newTime = Number(e.target.value);
+    setCurrentTime(newTime);
+  };
+
+  const handleSeekCommit = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!videoRef.current) return;
+    const newTime = Number(e.target.value);
+    videoRef.current.currentTime = newTime;
+  };
+
   return (
     <div className="bg-card rounded-lg p-6 border border-border">
       <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
@@ -537,6 +549,8 @@ const VideoPlayer = ({ analysisId }: { analysisId: string }) => {
           <video
             ref={videoRef}
             src={videoUrl}
+            preload="metadata"
+            crossOrigin="anonymous"
             className="w-full h-auto max-h-96"
             onPlay={() => setIsPlaying(true)}
             onPause={() => setIsPlaying(false)}
@@ -549,8 +563,22 @@ const VideoPlayer = ({ analysisId }: { analysisId: string }) => {
             playsInline
           />
           
-          {/* Custom Controls Overlay */}
+          {/* Custom Controls Overlay with Seek Bar */}
           <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent p-4">
+            <div className="w-full mb-2">
+              <input
+                type="range"
+                min={0}
+                max={Math.max(0, duration)}
+                step={0.01}
+                value={Math.min(currentTime, duration)}
+                onChange={handleSeekChange}
+                onInput={handleSeekChange}
+                onMouseUp={handleSeekCommit}
+                onTouchEnd={(e) => handleSeekCommit(e as any)}
+                className="w-full accent-primary"
+              />
+            </div>
             <div className="flex items-center justify-between text-white">
               <div className="flex items-center gap-3">
                 <button
@@ -749,7 +777,7 @@ export default function AnalysisReport({ file }: { file: any }) {
   return (
     <div className="space-y-10">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-           <MetricCard label="Overall Dexterity Score" value={summary.overall_dexterity_score?.toFixed(2) || 'N/A'} unit="/ 100" className="md:col-span-1 bg-card border" />
+           <MetricCard label="Overall Dexterity Score" value={(summary.Overall?.dexterity_score ?? NaN) ? Number(summary.Overall.dexterity_score).toFixed(2) : 'N/A'} unit="/ 100" className="md:col-span-1 bg-card border" />
            <div className="md:col-span-2 grid grid-cols-1 gap-4">
                 <MetricCard label="File Name" value={file.name} className="col-span-2"/>
            </div>

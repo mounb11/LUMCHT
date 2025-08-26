@@ -2,7 +2,7 @@ import asyncio
 import shutil
 import sqlite3
 import uuid
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, WebSocket, WebSocketDisconnect, Form
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, WebSocket, WebSocketDisconnect, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 import mediapipe as mp
@@ -13,10 +13,11 @@ import numpy as np
 import time
 import json
 from one_euro_filter_local import OneEuroFilter
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 from contextlib import asynccontextmanager
 import os
 import logging
+import warnings
 from mediapipe.framework.formats import landmark_pb2
 import io
 import csv
@@ -25,16 +26,26 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 from scipy.signal import butter, filtfilt
 from pathlib import Path
+from statistics import mean
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Suppress known protobuf deprecation warning noise
+warnings.filterwarnings(
+    "ignore",
+    message=r"SymbolDatabase.GetPrototype\(\) is deprecated"
+)
+
 DATABASE_URL = "laixr_handtracking_dev.db"
-UPLOAD_DIR = "uploads"
-MODELS_DIR = "models"
+# Ensure paths are anchored to this file's directory
+BASE_DIR = os.path.dirname(__file__)
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+MODELS_DIR = os.path.join(BASE_DIR, "models")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
+DATABASE_URL = os.path.join(BASE_DIR, "laixr_handtracking_dev.db")
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), 'models', 'hand_landmarker.task')
 
@@ -65,6 +76,15 @@ def db_query_all(query, params=()):
     return result
 
 def init_db():
+    # Migrate database if previously created in project root when started with different working dir
+    try:
+        project_root = os.path.abspath(os.path.join(BASE_DIR, ".."))
+        legacy_db = os.path.join(project_root, "laixr_handtracking_dev.db")
+        if os.path.exists(legacy_db) and not os.path.exists(DATABASE_URL):
+            shutil.copyfile(legacy_db, DATABASE_URL)
+            logger.info(f"Migrated legacy database from {legacy_db} to {DATABASE_URL}")
+    except Exception as e:
+        logger.warning(f"Database migration check failed: {e}")
     db_execute("""
     CREATE TABLE IF NOT EXISTS analyses (
         id TEXT PRIMARY KEY,
@@ -394,14 +414,14 @@ def perform_analysis(analysis_id: str, file_path: str, params: Dict[str, Any], l
             params.update({"fps": fps, "image_width": frame_width, "image_height": frame_height})
             db_execute("UPDATE analyses SET analysis_parameters = ? WHERE id = ?", (json.dumps(params), analysis_id))
 
-            # Set up video writer for annotated output with H.264 codec for better browser compatibility
+            # Set up video writer for annotated output. Prefer H.264 (avc1) for broad browser compatibility; fallback to mp4v.
             annotated_video_path = os.path.join(UPLOAD_DIR, f"{analysis_id}_annotated.mp4")
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 codec for better browser support
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')
             out = cv2.VideoWriter(annotated_video_path, fourcc, fps, (frame_width, frame_height))
-            
-            # Fallback to mp4v if avc1 fails
+
+            # Fallback to MPEG-4 Part 2 if H.264 isn't available in the environment
             if not out.isOpened():
-                logger.warning("H.264 codec not available, falling back to mp4v")
+                logger.warning("H.264 (avc1) encoder not available, falling back to mp4v")
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 out = cv2.VideoWriter(annotated_video_path, fourcc, fps, (frame_width, frame_height))
 
@@ -410,6 +430,7 @@ def perform_analysis(analysis_id: str, file_path: str, params: Dict[str, Any], l
             raw_landmarks_data = []
             filtered_landmarks_data = []
 
+            last_sent_ts = 0.0  # throttle websocket to ~10 fps
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret: break
@@ -473,10 +494,13 @@ def perform_analysis(analysis_id: str, file_path: str, params: Dict[str, Any], l
                 # Write the annotated frame to the output video
                 out.write(annotated_frame)
 
-                # Send frame to WebSocket for live viewing
+                # Send frame to WebSocket for live viewing (throttled)
                 try:
-                    _, buffer = cv2.imencode('.jpg', annotated_frame)
-                    asyncio.run_coroutine_threadsafe(manager.send_frame(analysis_id, buffer.tobytes()), loop)
+                    now = time.time()
+                    if now - last_sent_ts >= 0.1:  # ~10 fps
+                        _, buffer = cv2.imencode('.jpg', annotated_frame)
+                        asyncio.run_coroutine_threadsafe(manager.send_frame(analysis_id, buffer.tobytes()), loop)
+                        last_sent_ts = now
                 except Exception as e:
                     logger.warning(f"Could not send frame to websocket for {analysis_id}: {e}")
             
@@ -540,8 +564,55 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+# Restrict CORS to allowed origins (comma-separated). If not provided, include localhost, 127.0.0.1 and local LAN IP on port 3000.
+_env_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
+if _env_origins == "*":
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,  # credentials not allowed with wildcard origins
+        allow_methods=["*"],
+        allow_headers=["*"]
+    )
+else:
+    origins = {o.strip() for o in _env_origins.split(",") if o.strip()}
+    if not origins:
+        # default dev origins
+        origins.update({
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        })
+        # Try to detect LAN IP and allow it
+        try:
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                lan_ip = s.getsockname()[0]
+            if lan_ip and not lan_ip.startswith("127."):
+                origins.add(f"http://{lan_ip}:3000")
+        except Exception:
+            pass
+    # Build a permissive regex for localhost/127.0.0.1 on any port, plus LAN IP on any port
+    origin_patterns = [r"^http://localhost(:\\d+)?$", r"^http://127\\.0\\.0\\.1(:\\d+)?$"]
+    try:
+        lan_pat = None
+        if 'lan_ip' in locals() and lan_ip:
+            escaped_lan_ip = lan_ip.replace('.', r'\.')
+            lan_pat = rf"^http://{escaped_lan_ip}(:\d+)?$"
+        if lan_pat:
+            origin_patterns.append(lan_pat)
+    except Exception:
+        pass
+    allow_origin_regex = "|".join(origin_patterns)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=sorted(origins),
+        allow_origin_regex=allow_origin_regex,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"]
+    )
 
 @app.get("/health")
 async def health_check(): return {"status": "ok"}
@@ -565,11 +636,28 @@ async def upload_file(
     palm_responsiveness_multiplier: float = Form(1.0)
 ):
     analysis_id = str(uuid.uuid4())
-    file_path = os.path.join(UPLOAD_DIR, f"{analysis_id}_{file.filename}")
+    # Sanitize filename and validate extension server-side
+    original_filename = file.filename or "uploaded_video"
+    safe_name = "".join([c for c in original_filename if c.isalnum() or c in "._- "]).strip().replace(" ", "_")
+    name_root, name_ext = os.path.splitext(safe_name)
+    allowed_exts = {".mp4", ".mov", ".avi", ".webm", ".mkv"}
+    if name_ext.lower() not in allowed_exts:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type '{name_ext}'. Allowed: {', '.join(sorted(allowed_exts))}")
+    safe_name = f"{name_root[:100]}{name_ext.lower()}" if name_root else f"video{name_ext.lower()}"
+    file_path = os.path.join(UPLOAD_DIR, f"{analysis_id}_{safe_name}")
     loop = asyncio.get_running_loop()
     try:
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+        # Enforce max file size (2GB)
+        max_size_bytes = int(float(os.getenv("MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024))))
+        try:
+            saved_size = os.path.getsize(file_path)
+            if saved_size > max_size_bytes:
+                os.remove(file_path)
+                raise HTTPException(status_code=400, detail="File too large. Max 2GB")
+        except OSError:
+            pass
         analysis_params = {
             "min_detection_confidence": min_detection_confidence, "min_tracking_confidence": min_tracking_confidence,
             "filter_min_cutoff": filter_min_cutoff, "filter_beta": filter_beta,
@@ -582,7 +670,7 @@ async def upload_file(
             "joint_filter_multiplier": joint_filter_multiplier,
             "palm_responsiveness_multiplier": palm_responsiveness_multiplier}
         db_execute("INSERT INTO analyses (id, original_name, status, analysis_parameters, video_path) VALUES (?, ?, ?, ?, ?)",
-            (analysis_id, file.filename, 'processing', json.dumps(analysis_params), file_path))
+            (analysis_id, safe_name, 'processing', json.dumps(analysis_params), file_path))
         background_tasks.add_task(perform_analysis, analysis_id, file_path, analysis_params, loop)
         return JSONResponse(status_code=200, content={"analysis_id": analysis_id, "message": "Analysis started"})
     except Exception as e:
@@ -594,6 +682,89 @@ async def get_analyses():
     analyses = db_query_all("SELECT id, original_name, status, created_at, error_message, results, analysis_parameters FROM analyses ORDER BY created_at DESC")
     return [dict(row) for row in analyses] if analyses else []
 
+@app.get("/api/analyses/download_raw_landmarks_csv")
+async def download_all_raw_landmarks_csv():
+    analyses = db_query_all("SELECT id, original_name, raw_landmarks_json, analysis_parameters FROM analyses WHERE status = 'completed' ORDER BY created_at DESC")
+    if not analyses:
+        raise HTTPException(status_code=404, detail="No completed analyses found to export.")
+    output = io.StringIO()
+    writer = csv.writer(output)
+    headers = [
+        'analysis_id', 'original_name',
+        'timestamp', 'hand', 'landmark_id',
+        'x_normalized', 'y_normalized', 'z_normalized',
+        'x_pixels', 'y_pixels'
+    ]
+    writer.writerow(headers)
+    for row in analyses:
+        try:
+            raw_json = row['raw_landmarks_json']
+            if not raw_json:
+                continue
+            params = json.loads(row['analysis_parameters']) if row['analysis_parameters'] else {}
+            image_width = params.get('image_width', 1)
+            image_height = params.get('image_height', 1)
+            df = pd.read_json(raw_json)
+            if df.empty:
+                continue
+            df['x_pixels'] = df['x'] * image_width
+            df['y_pixels'] = df['y'] * image_height
+            for _, r in df.iterrows():
+                writer.writerow([
+                    row['id'], row['original_name'],
+                    r['time'], r['hand'], r['landmark_id'],
+                    r['x'], r['y'], r['z'],
+                    r['x_pixels'], r['y_pixels']
+                ])
+        except Exception:
+            continue
+    output.seek(0)
+    return StreamingResponse(output, media_type="text/csv", headers={"Content-Disposition": f"attachment; filename=all_raw_landmarks_{time.strftime('%Y%m%d')}.csv"})
+
+@app.get("/api/analyses/download_timeseries_csv")
+async def download_all_timeseries_csv():
+    analyses = db_query_all("SELECT id, original_name, results FROM analyses WHERE status = 'completed' ORDER BY created_at DESC")
+    if not analyses:
+        raise HTTPException(status_code=404, detail="No completed analyses found to export.")
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['analysis_id', 'original_name', 'timestamp_seconds', 'hand', 'velocity_pps', 'acceleration_pps2', 'jerk_pps3', 'cumulative_jerk_pps3s', 'cumulative_path_length_pixels'])
+    for a in analyses:
+        try:
+            results = json.loads(a['results']) if a['results'] else {}
+            analysis_data = results.get('analysis', {})
+            all_timestamps = set()
+            for metric_data in analysis_data.values():
+                for item in metric_data:
+                    all_timestamps.add(item['time'])
+            sorted_times = sorted(all_timestamps)
+            velocity_lookup = {(item['time'], item['hand']): item.get('Velocity') for item in analysis_data.get('velocity', [])}
+            acceleration_lookup = {(item['time'], item['hand']): item.get('Acceleration') for item in analysis_data.get('acceleration', [])}
+            jerk_lookup = {(item['time'], item['hand']): item.get('Jerk') for item in analysis_data.get('jerk', [])}
+            cumulative_jerk_lookup = {(item['time'], item['hand']): item.get('Cumulative Jerk') for item in analysis_data.get('cumulative_jerk', [])}
+            path_lookup = {(item['time'], item['hand']): item.get('Cumulative Path Length') for item in analysis_data.get('cumulative_path_length', [])}
+            for hand_label in ['Left', 'Right']:
+                for t in sorted_times:
+                    key = (t, hand_label)
+                    if key in velocity_lookup or key in acceleration_lookup or key in jerk_lookup or key in cumulative_jerk_lookup or key in path_lookup:
+                        writer.writerow([
+                            a['id'], a['original_name'],
+                            t, hand_label,
+                            velocity_lookup.get(key, ''),
+                            acceleration_lookup.get(key, ''),
+                            jerk_lookup.get(key, ''),
+                            cumulative_jerk_lookup.get(key, ''),
+                            path_lookup.get(key, '')
+                        ])
+        except Exception:
+            continue
+    output.seek(0)
+    return StreamingResponse(output, media_type="text/csv", headers={"Content-Disposition": f"attachment; filename=all_timeseries_{time.strftime('%Y%m%d')}.csv"})
+
+@app.get("/api/analyses/download_final_values_csv")
+async def download_all_final_values_csv():
+    # Reuse existing aggregated metrics endpoint behavior for compatibility
+    return await download_all_metrics_csv()
 @app.get("/api/analyses/download_metrics_csv")
 async def download_all_metrics_csv():
     analyses = db_query_all("SELECT id, original_name, created_at, results FROM analyses WHERE status = 'completed' ORDER BY created_at DESC")
@@ -665,82 +836,85 @@ async def delete_analysis(analysis_id: str):
     return {"message": "Analysis deleted successfully"}
 
 @app.get("/api/analysis/{analysis_id}/video")
-async def get_analysis_video(analysis_id: str):
+async def get_analysis_video(request: Request, analysis_id: str):
     analysis = db_query_one("SELECT annotated_video_path FROM analyses WHERE id = ?", (analysis_id,))
     if not analysis or not analysis['annotated_video_path'] or not os.path.exists(analysis['annotated_video_path']):
         raise HTTPException(status_code=404, detail="Annotated video file not found for this analysis.")
     
     video_path = analysis['annotated_video_path']
-    
-    # Check if file is readable
-    try:
-        with open(video_path, 'rb') as f:
-            f.read(1)  # Try to read first byte
-    except Exception as e:
-        logger.error(f"Cannot read video file {video_path}: {e}")
-        raise HTTPException(status_code=500, detail="Video file is corrupted or inaccessible.")
-    
-    return FileResponse(
-        video_path, 
-        media_type="video/mp4", 
-        headers={
-            "Accept-Ranges": "bytes",
-            "Content-Type": "video/mp4",
-            "Cache-Control": "public, max-age=3600"
-        }
-    )
+
+    return await _range_stream_video(request, video_path)
 
 @app.get("/api/analysis/{analysis_id}/original_video")
-async def get_original_video(analysis_id: str):
+async def get_original_video(request: Request, analysis_id: str):
     analysis = db_query_one("SELECT video_path FROM analyses WHERE id = ?", (analysis_id,))
     if not analysis or not analysis['video_path'] or not os.path.exists(analysis['video_path']):
         raise HTTPException(status_code=404, detail="Original video file not found for this analysis.")
     
     video_path = analysis['video_path']
-    
-    # Check if file is readable
-    try:
-        with open(video_path, 'rb') as f:
-            f.read(1)  # Try to read first byte
-    except Exception as e:
-        logger.error(f"Cannot read video file {video_path}: {e}")
-        raise HTTPException(status_code=500, detail="Video file is corrupted or inaccessible.")
-    
-    return FileResponse(
-        video_path, 
-        media_type="video/mp4", 
-        headers={
-            "Accept-Ranges": "bytes",
-            "Content-Type": "video/mp4",
-            "Cache-Control": "public, max-age=3600"
-        }
-    )
+    return await _range_stream_video(request, video_path)
 
 @app.get("/api/analysis/{analysis_id}/annotated_video")
-async def get_annotated_video(analysis_id: str):
+async def get_annotated_video(request: Request, analysis_id: str):
     analysis = db_query_one("SELECT annotated_video_path FROM analyses WHERE id = ?", (analysis_id,))
     if not analysis or not analysis['annotated_video_path'] or not os.path.exists(analysis['annotated_video_path']):
         raise HTTPException(status_code=404, detail="Annotated video file not found for this analysis.")
     
     video_path = analysis['annotated_video_path']
-    
-    # Check if file is readable
+    return await _range_stream_video(request, video_path)
+
+def _iter_file_range(path: str, start: int, end: int, chunk_size: int = 1024 * 1024):
+    with open(path, 'rb') as f:
+        f.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            read_size = min(chunk_size, remaining)
+            data = f.read(read_size)
+            if not data:
+                break
+            yield data
+            remaining -= len(data)
+
+async def _range_stream_video(request: Request, path: str):
     try:
-        with open(video_path, 'rb') as f:
-            f.read(1)  # Try to read first byte
+        file_size = os.path.getsize(path)
     except Exception as e:
-        logger.error(f"Cannot read video file {video_path}: {e}")
-        raise HTTPException(status_code=500, detail="Video file is corrupted or inaccessible.")
-    
-    return FileResponse(
-        video_path, 
-        media_type="video/mp4", 
-        headers={
-            "Accept-Ranges": "bytes",
+        logger.error(f"Cannot stat video file {path}: {e}")
+        raise HTTPException(status_code=500, detail="Video file is inaccessible.")
+
+    range_header = request.headers.get('range')
+    if range_header:
+        # Example: bytes=0-1023
+        try:
+            units, _, range_spec = range_header.partition('=')
+            if units != 'bytes':
+                raise ValueError("Only 'bytes' ranges are supported")
+            start_str, _, end_str = range_spec.partition('-')
+            start = int(start_str) if start_str else 0
+            end = int(end_str) if end_str else file_size - 1
+            if start > end or end >= file_size:
+                raise ValueError("Invalid range")
+        except Exception:
+            # Malformed range
+            return JSONResponse(status_code=416, content={"detail": "Invalid Range header"})
+
+        headers = {
             "Content-Type": "video/mp4",
-            "Cache-Control": "public, max-age=3600"
+            "Accept-Ranges": "bytes",
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Content-Length": str(end - start + 1),
+            "Cache-Control": "public, max-age=3600",
         }
-    )
+        return StreamingResponse(_iter_file_range(path, start, end), status_code=206, headers=headers)
+
+    # No Range header: return full file
+    headers = {
+        "Content-Type": "video/mp4",
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(file_size),
+        "Cache-Control": "public, max-age=3600",
+    }
+    return StreamingResponse(_iter_file_range(path, 0, file_size - 1), status_code=200, headers=headers)
 
 @app.get("/api/analysis/{analysis_id}/download_csv")
 async def download_analysis_csv(analysis_id: str):
@@ -870,6 +1044,10 @@ async def download_analysis_csv(analysis_id: str):
             # Calculate final cumulative jerk and dimensionless jerk if not in summary
             final_cumulative_jerk = ''
             final_dimensionless_jerk = ''
+            final_average_velocity_pps = ''
+            final_average_acceleration_pps2 = ''
+            final_squared_jerk_integral = ''
+            final_peak_jerk_pps3 = final_peak_jerk  # backward compatible variable name
             if cumulative_jerk_data:
                 final_cumulative_jerk = max(cumulative_jerk_data.values())
                 # Calculate dimensionless jerk if we have the data
@@ -877,8 +1055,15 @@ async def download_analysis_csv(analysis_id: str):
                     movement_duration = timestamps[-1] - timestamps[0]
                     path_length_for_jerk = np.linalg.norm(pos[-1] - pos[0])
                     if path_length_for_jerk > 1e-6 and movement_duration > 1e-6:
-                        squared_jerk_integral = np.sum(jerk_mag**2) * dt
-                        final_dimensionless_jerk = ((movement_duration**3) / (path_length_for_jerk**2)) * squared_jerk_integral
+                        squared_jerk_integral_val = np.sum(jerk_mag**2) * dt
+                        final_dimensionless_jerk = ((movement_duration**3) / (path_length_for_jerk**2)) * squared_jerk_integral_val
+                        final_squared_jerk_integral = squared_jerk_integral_val
+
+                # Compute averages
+                if len(velocity_vec) > 0:
+                    final_average_velocity_pps = float(np.mean(velocity_mag))
+                if 'acceleration_mag' in locals() and len(acceleration_mag) > 0:
+                    final_average_acceleration_pps2 = float(np.mean(acceleration_mag))
             
             # Merge palm center data back to hand_df
             palm_center_map = {row['time']: (row['palm_x'], row['palm_y']) 
@@ -1192,6 +1377,269 @@ async def download_analysis_final_values_csv(analysis_id: str):
     except Exception as e:
         logger.error(f"Failed to generate final values CSV for analysis {analysis_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate final values CSV data.")
+
+# --- Statistics Endpoints (removed by request) ---
+"""
+The following statistics endpoints and helpers were removed per user request.
+"""
+def _parse_date(date_str: str) -> str:
+    """Validate simple YYYY-MM-DD date and convert to SQLite comparable ranges."""
+    try:
+        # Accept only simple date format
+        datetime.strptime(date_str, "%Y-%m-%d")
+        return date_str
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+def _load_completed_analyses(from_date: Optional[str], to_date: Optional[str]):
+    query = "SELECT id, created_at, results FROM analyses WHERE status = 'completed'"
+    params: list[str] = []
+    if from_date:
+        query += " AND date(created_at) >= date(?)"
+        params.append(from_date)
+    if to_date:
+        query += " AND date(created_at) <= date(?)"
+        params.append(to_date)
+    query += " ORDER BY created_at ASC"
+    rows = db_query_all(query, tuple(params))
+    analyses = []
+    for row in rows:
+        try:
+            results = json.loads(row["results"]) if row["results"] else {}
+        except Exception:
+            results = {}
+        analyses.append({
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "results": results,
+        })
+    return analyses
+
+def _collect_hand_metric_values(analyses: List[dict], hand: str, metric: str) -> List[float]:
+    values: List[float] = []
+    for a in analyses:
+        summary = a.get("results", {}).get("summary", {})
+        hand_summary = summary.get(hand, {})
+        v = hand_summary.get(metric)
+        if isinstance(v, (int, float)):
+            values.append(float(v))
+    return values
+
+def _collect_overall_dexterity(analyses: List[dict]) -> List[float]:
+    values: List[float] = []
+    for a in analyses:
+        overall = a.get("results", {}).get("summary", {}).get("Overall", {})
+        v = overall.get("dexterity_score")
+        if isinstance(v, (int, float)):
+            values.append(float(v))
+    return values
+
+def _summary_stats(values: List[float]) -> dict:
+    if not values:
+        return {"count": 0, "mean": None, "median": None, "std": None, "p25": None, "p75": None, "min": None, "max": None}
+    arr = np.array(values, dtype=float)
+    return {
+        "count": int(arr.size),
+        "mean": float(np.mean(arr)),
+        "median": float(np.median(arr)),
+        "std": float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0,
+        "p25": float(np.percentile(arr, 25)),
+        "p75": float(np.percentile(arr, 75)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+    }
+
+@app.get("/api/stats/summary")
+async def stats_summary(from_date: Optional[str] = None, to_date: Optional[str] = None, hand: Optional[str] = None):
+    if from_date:
+        from_date = _parse_date(from_date)
+    if to_date:
+        to_date = _parse_date(to_date)
+
+    analyses = _load_completed_analyses(from_date, to_date)
+    metrics = [
+        "total_path_pixels",
+        "peak_velocity_pps",
+        "average_velocity_pps",
+        "peak_acceleration_pps2",
+        "average_acceleration_pps2",
+        "peak_jerk_pps3",
+        "total_cumulative_jerk",
+        "log_dimensionless_jerk",
+        "dimensionless_jerk",
+        "squared_jerk_integral",
+    ]
+
+    hands = [hand] if hand in ("Left", "Right") else ["Left", "Right"]
+    hand_summaries: dict[str, dict] = {}
+    for h in hands:
+        hand_summaries[h] = {m: _summary_stats(_collect_hand_metric_values(analyses, h, m)) for m in metrics}
+
+    overall_values = _collect_overall_dexterity(analyses)
+
+    return {
+        "filters": {"from": from_date, "to": to_date, "hand": hand},
+        "counts": {"total_completed": len(analyses)},
+        "overall_dexterity": _summary_stats(overall_values),
+        "hand_summaries": hand_summaries,
+    }
+
+@app.get("/api/stats/distribution")
+async def stats_distribution(metric: str, hand: str = "Left", bins: int = 20, from_date: Optional[str] = None, to_date: Optional[str] = None):
+    if hand not in ("Left", "Right"):
+        raise HTTPException(status_code=400, detail="hand must be 'Left' or 'Right'")
+    if from_date:
+        from_date = _parse_date(from_date)
+    if to_date:
+        to_date = _parse_date(to_date)
+
+    analyses = _load_completed_analyses(from_date, to_date)
+    values = _collect_hand_metric_values(analyses, hand, metric)
+    if not values:
+        return {"metric": metric, "hand": hand, "bins": [], "counts": []}
+    counts, bin_edges = np.histogram(values, bins=bins)
+    return {
+        "metric": metric,
+        "hand": hand,
+        "bins": [float(b) for b in bin_edges.tolist()],
+        "counts": [int(c) for c in counts.tolist()],
+        "count": len(values)
+    }
+
+@app.get("/api/stats/trends")
+async def stats_trends(metric: str = "dexterity_score_overall", interval: str = "daily", from_date: Optional[str] = None, to_date: Optional[str] = None, hand: Optional[str] = None):
+    if from_date:
+        from_date = _parse_date(from_date)
+    if to_date:
+        to_date = _parse_date(to_date)
+    if interval not in ("daily", "weekly", "monthly"):
+        raise HTTPException(status_code=400, detail="interval must be daily|weekly|monthly")
+
+    analyses = _load_completed_analyses(from_date, to_date)
+
+    # Extract values per analysis date key
+    buckets: dict[str, list[float]] = {}
+    for a in analyses:
+        # Determine bucket key
+        try:
+            dt = datetime.fromisoformat(a["created_at"])  # created_at is SQLite timestamp
+        except Exception:
+            try:
+                dt = datetime.strptime(a["created_at"], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                continue
+        if interval == "daily":
+            key = dt.strftime("%Y-%m-%d")
+        elif interval == "weekly":
+            key = f"{dt.strftime('%Y')}-W{dt.isocalendar().week:02d}"
+        else:
+            key = dt.strftime("%Y-%m")
+
+        # Pick value
+        if metric == "dexterity_score_overall":
+            v_list = _collect_overall_dexterity([a])
+        else:
+            # Expect format: metricName:hand (e.g., peak_velocity_pps:Left)
+            if ":" in metric:
+                mname, h = metric.split(":", 1)
+            else:
+                mname, h = metric, (hand or "Left")
+            v_list = _collect_hand_metric_values([a], h, mname)
+        if v_list:
+            buckets.setdefault(key, []).extend(v_list)
+
+    # Aggregate mean per bucket
+    series = [{"bucket": k, "mean": float(np.mean(vs)), "count": len(vs)} for k, vs in sorted(buckets.items())]
+    return {"metric": metric, "interval": interval, "series": series}
+
+@app.get("/api/stats/summary_csv")
+async def stats_summary_csv(from_date: Optional[str] = None, to_date: Optional[str] = None):
+    if from_date:
+        from_date = _parse_date(from_date)
+    if to_date:
+        to_date = _parse_date(to_date)
+    analyses = _load_completed_analyses(from_date, to_date)
+    metrics = [
+        "total_path_pixels",
+        "peak_velocity_pps",
+        "average_velocity_pps",
+        "peak_acceleration_pps2",
+        "average_acceleration_pps2",
+        "peak_jerk_pps3",
+        "total_cumulative_jerk",
+        "log_dimensionless_jerk",
+        "dimensionless_jerk",
+        "squared_jerk_integral",
+    ]
+    output = _io.StringIO()
+    writer = csv.writer(output)
+    header = ["hand", "metric", "count", "mean", "median", "std", "p25", "p75", "min", "max"]
+    writer.writerow(header)
+    for hand in ["Left", "Right"]:
+        for m in metrics:
+            stats_obj = _summary_stats(_collect_hand_metric_values(analyses, hand, m))
+            writer.writerow([
+                hand, m,
+                stats_obj["count"],
+                stats_obj["mean"],
+                stats_obj["median"],
+                stats_obj["std"],
+                stats_obj["p25"],
+                stats_obj["p75"],
+                stats_obj["min"],
+                stats_obj["max"],
+            ])
+    output.seek(0)
+    return StreamingResponse(output, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=stats_summary.csv"})
+
+@app.get("/api/stats/correlation")
+async def stats_correlation(hand: Optional[str] = "Left", method: str = "spearman", from_date: Optional[str] = None, to_date: Optional[str] = None):
+    if hand not in ("Left", "Right"):
+        raise HTTPException(status_code=400, detail="hand must be 'Left' or 'Right'")
+    if method not in ("pearson", "spearman"):
+        raise HTTPException(status_code=400, detail="method must be pearson|spearman")
+    if from_date:
+        from_date = _parse_date(from_date)
+    if to_date:
+        to_date = _parse_date(to_date)
+    analyses = _load_completed_analyses(from_date, to_date)
+    metrics = [
+        "total_path_pixels",
+        "peak_velocity_pps",
+        "average_velocity_pps",
+        "peak_acceleration_pps2",
+        "average_acceleration_pps2",
+        "peak_jerk_pps3",
+        "total_cumulative_jerk",
+        "log_dimensionless_jerk",
+        "dimensionless_jerk",
+        "squared_jerk_integral",
+    ]
+    # Build matrix
+    rows = []
+    for a in analyses:
+        row = []
+        hs = a.get("results", {}).get("summary", {}).get(hand, {})
+        for m in metrics:
+            v = hs.get(m)
+            row.append(float(v) if isinstance(v, (int, float)) else np.nan)
+        rows.append(row)
+    if not rows:
+        return {"hand": hand, "metrics": metrics, "correlation": []}
+    data = np.array(rows, dtype=float)
+    # Remove rows with all nan
+    data = data[~np.isnan(data).all(axis=1)]
+    if data.shape[0] < 2:
+        return {"hand": hand, "metrics": metrics, "correlation": []}
+    if method == "pearson":
+        corr = np.corrcoef(np.nan_to_num(data, nan=np.nanmean(data, axis=0)), rowvar=False)
+    else:
+        # Spearman: rank transform per column, then Pearson on ranks
+        ranks = np.apply_along_axis(lambda col: _stats.rankdata(col, nan_policy='omit'), 0, data)
+        corr = np.corrcoef(np.nan_to_num(ranks, nan=np.nanmean(ranks, axis=0)), rowvar=False)
+    # Clip numerical noise to [-1,1]
+    corr = np.clip(corr, -1.0, 1.0)
+    return {"hand": hand, "method": method, "metrics": metrics, "correlation": corr.tolist()}
 
 if __name__ == "__main__":
     import uvicorn

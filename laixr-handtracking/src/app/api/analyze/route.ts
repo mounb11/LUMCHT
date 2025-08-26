@@ -2,8 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { writeFile, readFile } from 'fs/promises';
 import path from 'path';
 
-// Since MediaPipe requires DOM APIs, we'll simulate the analysis server-side
-// and use the client-side analysis for real processing
+// Note: This route is not used in production. Frontend talks to Python backend directly.
 export async function POST(request: NextRequest) {
   try {
     const { fileId, filename } = await request.json();

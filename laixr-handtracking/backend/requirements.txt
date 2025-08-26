@@ -1,12 +1,10 @@
-fastapi
-uvicorn
+fastapi==0.115.5
+uvicorn[standard]==0.30.6
 python-multipart
-websockets
-numpy
-opencv-python
-mediapipe
-# OneEuroFilter has been vendored locally
-# OneEuroFilter
-pydantic
-scipy
-pandas 
+websockets==12.0
+numpy==1.26.4
+opencv-python==4.10.0.84
+mediapipe==0.10.14
+pydantic==2.7.4
+scipy==1.13.1
+pandas==2.2.2
